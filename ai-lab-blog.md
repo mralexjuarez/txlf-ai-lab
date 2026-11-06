@@ -55,7 +55,7 @@ brew install lima
 
 On Linux without Homebrew, grab the tarball from the [Lima releases page](https://github.com/lima-vm/lima/releases) and extract it under `/usr/local`. Linux hosts also need QEMU (`sudo apt install qemu-system-x86` or your distro's equivalent) and your user in the `kvm` group. Verify with `limactl --version` — anything v1.0+ works, v2.x is current.
 
-**2. Get the workshop folder in place.** Unzip or clone the repo so the files live at `~/ai-lab`. The path matters: our Lima template mounts exactly that folder into the VM.
+**2. Get the workshop folder in place.** Unzip or clone the repo so the files live at `~/ai-lab`. That path matters twice over: the template shares exactly that host folder, and pins it to `~/ai-lab` *inside* the VM too. Clone somewhere else and Lima cheerfully creates an empty `~/ai-lab` on the host, mounts that, and boots a VM with none of the workshop files in it — which is what the readiness probe in the current template exists to catch.
 
 **3. Create the VM.**
 
@@ -76,8 +76,8 @@ limactl shell ai-lab ollama pull nomic-embed-text
 **5. Set up Python inside the VM.**
 
 ```bash
-cd ~/ai-lab
-limactl shell ai-lab            # you're now inside the VM, in this folder
+limactl shell ai-lab            # from the host, enter the VM
+cd ~/ai-lab                     # the shared folder, in the VM
 python3 -m venv ~/venv
 source ~/venv/bin/activate
 pip install requests chromadb
@@ -85,9 +85,12 @@ pip install requests chromadb
 
 The venv lives in the VM's home directory rather than the shared folder, because shared-folder filesystems and virtualenvs don't always get along.
 
+You may see `cd: /Users/you/ai-lab: No such file or directory` as the shell opens. That is Lima trying your host path, which does not exist in the guest because the folder is mounted at `~/ai-lab`; the shell falls back to the VM's home and everything still works. `cd ~/ai-lab` is always the way in.
+
 **6. Smoke test.** Still inside the VM with the venv active:
 
 ```bash
+cd ~/ai-lab
 python3 smoke_test.py
 ```
 
@@ -129,7 +132,7 @@ limactl stop <name>        # shut down (state preserved)
 limactl delete <name>      # gone. completely.
 ```
 
-One behavior worth knowing: `limactl shell` drops you into the guest at your *current host directory* — if that directory is mounted into the VM. That's why we always `cd ~/ai-lab` first. It makes the host/guest boundary almost disappear.
+One behavior worth knowing: `limactl shell` tries to open the guest shell in your *current host directory*, provided that directory is mounted into the VM. Our workshop folder is mounted at `~/ai-lab` in the guest rather than at its host path, so current Lima releases print a harmless `cd:` error and land you in the VM's home instead; `cd ~/ai-lab` gets you to the files. (Lima master maps the host path through the mount point, which makes that hop seamless.)
 
 ### Lab 1: Kick the tires
 
@@ -175,7 +178,7 @@ Note how fast the second VM was to create: Lima caches downloaded images, so new
 
 ### Anatomy of our template
 
-Here is the entire definition of the lab you're sitting in — `ai-lab.yaml`, unabridged:
+Here is the entire definition of the lab you're sitting in — `ai-lab.yaml`:
 
 ```yaml
 # ai-lab.yaml — a repeatable local Linux lab for LLMs + RAG
@@ -195,8 +198,13 @@ memory: "8GiB"
 disk: "30GiB"
 
 # Share ONLY the workshop folder, and make it writable.
+# `location` is the folder on the host; `mountPoint` is where it shows up in the
+# guest. Lima defaults mountPoint to the host path (e.g. /Users/you/ai-lab), so
+# we set it explicitly and the files appear at ~/ai-lab inside the VM.
+# (In mountPoint, {{.Home}} is the guest's home, not the host's.)
 mounts:
   - location: "~/ai-lab"
+    mountPoint: "{{.Home}}/ai-lab"
     writable: true
 
 # Make the Ollama API inside the VM reachable at localhost:11434 on the host.
@@ -219,7 +227,7 @@ provision:
       systemctl daemon-reload
       systemctl enable --now ollama
 
-# Don't report "ready" until Ollama is actually answering.
+# Don't report "ready" until Ollama is answering and the share is populated.
 probes:
   - description: "ollama API to be ready"
     script: |
@@ -227,9 +235,23 @@ probes:
       until curl -sf http://localhost:11434/api/version >/dev/null 2>&1; do
         sleep 3
       done
+  # An empty shared folder is otherwise silent: the VM boots fine and you only
+  # find out in step 6, when smoke_test.py is missing.
+  - description: "workshop files to be visible at ~/ai-lab"
+    script: |
+      #!/bin/bash
+      test -f "{{.Home}}/ai-lab/smoke_test.py"
+    hint: |
+      The VM is up, but ~/ai-lab/smoke_test.py is not there, which means the
+      folder Lima shared is empty or in the wrong place.
+      Check that ai-lab.yaml sits in the same folder as smoke_test.py (see step 2
+      of README.md), then recreate the instance:
+        limactl delete ai-lab
+        limactl start ./ai-lab.yaml
+      The VM is still usable meanwhile: `limactl shell ai-lab`.
 ```
 
-Read it top to bottom and notice what each block buys us. The **pinned image** means the workshop behaves the same in a year (the built-in `template:default` tracks the newest Ubuntu, which is great for daily use and wrong for a reproducible lab). The **mount** grants writable access to one folder instead of your whole home directory. The **port forward** is how your host tools will reach the model. The **provision script** is where that scary `curl | sh` goes to live safely. And the **probe** makes `limactl start` block until Ollama is genuinely up, so "it started" means "it works."
+Read it top to bottom and notice what each block buys us. The **pinned image** means the workshop behaves the same in a year (the built-in `template:default` tracks the newest Ubuntu, which is great for daily use and wrong for a reproducible lab). The **mount** grants writable access to one folder instead of your whole home directory, and decides where that folder lands in the guest. Without `mountPoint`, Lima mounts a directory at its host path: `/Users/you/ai-lab` on macOS, `/home/you/ai-lab` on Linux. Neither is the guest's own home — Lima gives the guest user a home of `/home/you.guest` — so `~` inside the VM would not be where your files are. `{{.Home}}` in `mountPoint` is the *guest's* home (Lima evaluates `location` on the host and `mountPoint` in the guest), so the workshop folder is at `~/ai-lab` either way. The **port forward** is how your host tools will reach the model. The **provision script** is where that scary `curl | sh` goes to live safely. And the **probes** make `limactl start` block until Ollama is genuinely up *and* the shared folder actually contains the workshop files, so "it started" means "it works."
 
 That file is the deliverable of this workshop as much as any script is. When you get home, everything you build on top of it travels with it.
 
@@ -256,8 +278,8 @@ A model's "3B" means three billion parameters — learned numbers. Stored at ful
 Get inside the lab VM:
 
 ```bash
-cd ~/ai-lab
 limactl shell ai-lab
+cd ~/ai-lab
 ```
 
 **First, the CLI.** See what's installed and start a conversation:
@@ -518,6 +540,10 @@ limactl start ./ai-lab.yaml     # good as new, five minutes
 ## Troubleshooting
 
 **`limactl start` fails or hangs on the readiness probe.** The provision script may still be downloading Ollama on slow wifi — give it a few minutes. To investigate, run `limactl shell ai-lab -- systemctl status ollama`, or check the logs under `~/.lima/ai-lab/` on the host. If the service shows `inactive` and `disabled`, Ollama installed but never started, because its installer skips that step while the VM is still booting (look for `systemd is not running` in the provisioning log). The YAML above handles this with `systemctl enable --now ollama`. To fix a VM built without that line, run `limactl shell ai-lab sudo systemctl enable --now ollama`.
+
+**`limactl start` reports "workshop files to be visible at ~/ai-lab" as unmet, or `~/ai-lab` in the VM is empty.** The host folder Lima was told to share is empty or missing. Lima shares `~/ai-lab` from the host and quietly creates that directory if it does not exist, so a clone kept anywhere else produces a VM with no workshop files at all. Put the repo at `~/ai-lab` (a symlink to your checkout works fine), or point `location` in `ai-lab.yaml` at the real folder, then rebuild: `limactl delete ai-lab && limactl start ./ai-lab.yaml`.
+
+**A shell opens with `cd: /Users/you/ai-lab: No such file or directory`.** Cosmetic. Lima tries to start the shell in your host directory, while the workshop folder is mounted at `~/ai-lab` in the guest, so that `cd` cannot succeed and the shell falls back to the VM's home. Run `cd ~/ai-lab`. A VM created from the older template has the mirror-image problem — the folder exists in the guest only at its host path (`/Users/you/ai-lab`, or `/home/you/ai-lab` on a Linux host) and `~` looks empty — and needs `limactl delete ai-lab && limactl start ./ai-lab.yaml` to pick up the new `mountPoint`.
 
 **Port 11434 is already in use on the host.** You have Ollama installed natively on your host — the forward can't bind. Either stop the host service (`brew services stop ollama` on macOS, `sudo systemctl stop ollama` on Linux) or edit `hostPort` in the template to `11435` and use that from the host.
 
